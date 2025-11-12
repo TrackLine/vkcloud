@@ -66,6 +66,7 @@ nano .env
 - `VKCLOUD_PORT_ID` - конкретный порт ВМ (если не указано, будет выбран первый активный порт)
 - `VKCLOUD_TARGET_NET` - целевая подсеть для поиска IP (по умолчанию: `95.163.248.0/22`). Можно указать несколько подсетей через запятую, например: `95.163.248.0/22,192.168.1.0/24`
 - `VKCLOUD_WORKERS_COUNT` - количество параллельных воркеров (по умолчанию: `1`)
+- `VKCLOUD_SEQUENTIAL_IP_SCAN` - режим последовательного перебора IP внутри диапазона (по умолчанию: `false`). Если `true`, скрипт будет пытаться выделять IP адреса последовательно внутри целевых подсетей
 - `VKCLOUD_SLEEP_BETWEEN_ATTEMPTS` - пауза между попытками в секундах (по умолчанию: `0.6`)
 - `VKCLOUD_ASSOC_WAIT` - время ожидания подтверждения привязки в секундах (по умолчанию: `8.0`)
 - `VKCLOUD_WORK_DURATION_MINUTES` - время работы в минутах перед паузой (опционально, если не задано - работает до нахождения IP)
@@ -124,6 +125,32 @@ VKCLOUD_TARGET_NET=95.163.248.0/22,192.168.1.0/24,10.0.0.0/8
 ```
 
 Скрипт будет искать IP, принадлежащий любой из указанных подсетей.
+
+### Последовательный перебор IP внутри диапазона
+
+По умолчанию скрипт выделяет случайные floating IP и проверяет, попадают ли они в целевые подсети. Однако можно включить режим последовательного перебора IP адресов внутри диапазона.
+
+**Включение режима:**
+```bash
+export VKCLOUD_SEQUENTIAL_IP_SCAN=true
+python3 script.py
+```
+
+Или в `.env` файле:
+```bash
+VKCLOUD_SEQUENTIAL_IP_SCAN=true
+```
+
+**Как это работает:**
+- Скрипт генерирует IP адреса последовательно из целевых подсетей (например, 95.163.248.1, 95.163.248.2, и т.д.)
+- Пытается выделить каждый IP адрес по очереди
+- Если выделение конкретного IP не удается (не поддерживается OpenStack), автоматически переключается на случайный выбор
+- После завершения всех IP в подсети, перебор начинается заново
+
+**Важно:**
+- Не все OpenStack окружения поддерживают выделение конкретного IP адреса
+- Если ваше окружение не поддерживает эту функцию, скрипт автоматически переключится на обычный режим
+- Этот режим может быть медленнее, так как требует больше попыток выделения IP
 
 ### Режим работы по расписанию
 
@@ -282,7 +309,7 @@ sudo systemctl restart vkcloud-fip.service
 
 ## Настройка уведомлений через Apprise
 
-Скрипт поддерживает уведомления через [Apprise](https://github.com/caronc/apprise), который поддерживает множество сервисов: Telegram, Discord, Email, Slack, Pushover и многие другие.
+Скрипт поддерживает уведомления через [Apprise](https://github.com/caronc/apprise), который поддерживает множество сервисов: Telegram, Discord, Email, Slack, Pushover, Matrix, Microsoft Teams, Rocket.Chat и многие другие.
 
 ### Примеры настройки
 
@@ -293,31 +320,72 @@ sudo systemctl restart vkcloud-fip.service
 3. Узнайте ваш Chat ID (можно через [@userinfobot](https://t.me/userinfobot))
 4. Добавьте в `.env`:
 ```bash
-VKCLOUD_APPRISE_URL=telegram://<bot_token>@telegram/?chat=<chat_id>
+# Формат: tgram://<bot_token>@telegram/<chat_id>
+VKCLOUD_APPRISE_URL=tgram://123456789:ABCdefGHIjklMNOpqrsTUVwxyz@telegram/123456789
 ```
 
 #### Discord
 
-1. Создайте Webhook в настройках канала Discord
-2. Добавьте в `.env`:
+1. Создайте Webhook в настройках канала Discord (Параметры канала → Интеграции → Вебхуки)
+2. Скопируйте URL вебхука
+3. Добавьте в `.env`:
 ```bash
-VKCLOUD_APPRISE_URL=discord://<webhook_id>/<webhook_token>
+# Формат: discord://<webhook_id>/<webhook_token>
+VKCLOUD_APPRISE_URL=discord://123456789012345678/abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890
 ```
 
 #### Email
 
 ```bash
+# SMTP (Gmail, Outlook и др.)
 VKCLOUD_APPRISE_URL=mailto://user:password@gmail.com
+
+# С дополнительными параметрами:
+VKCLOUD_APPRISE_URL=mailto://user:password@smtp.gmail.com:587/?to=recipient@example.com
+```
+
+#### Slack
+
+```bash
+# Webhook
+VKCLOUD_APPRISE_URL=slack://token-a/token-b/token-c
+
+# Bot Token
+VKCLOUD_APPRISE_URL=slack://xoxb-12345678/#channel
+```
+
+#### Microsoft Teams
+
+```bash
+# Webhook
+VKCLOUD_APPRISE_URL=msteams://token-a/token-b/token-c
+```
+
+#### Matrix
+
+```bash
+VKCLOUD_APPRISE_URL=matrixs://user:password@synapse.example.com/#room:example.com
+```
+
+#### Pushover
+
+```bash
+VKCLOUD_APPRISE_URL=pover://user@token/
 ```
 
 #### Несколько сервисов одновременно
 
-Можно указать несколько URL через запятую:
+Можно указать несколько URL через запятую (без пробелов):
 ```bash
-VKCLOUD_APPRISE_URL=telegram://...@telegram/?chat=...,discord://.../...
+VKCLOUD_APPRISE_URL=tgram://bot_token@telegram/chat_id,discord://webhook_id/webhook_token,mailto://user:pass@gmail.com
 ```
 
-Полный список поддерживаемых сервисов и форматов URL: https://github.com/caronc/apprise
+**Важно:**
+- URL должны быть разделены запятыми без пробелов
+- Каждый URL должен быть валидным форматом Apprise
+- При ошибке отправки на один сервис, остальные продолжат работать
+
+Полный список поддерживаемых сервисов и форматов URL: [Apprise Documentation](https://github.com/caronc/apprise)
 
 ## Типы уведомлений
 
