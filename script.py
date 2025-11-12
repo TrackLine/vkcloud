@@ -76,6 +76,10 @@ TARGET_NET_STR = os.getenv("VKCLOUD_TARGET_NET", "95.163.248.0/22")
 TARGET_NET = ipaddress.ip_network(TARGET_NET_STR)
 WORKERS_COUNT = int(os.getenv("VKCLOUD_WORKERS_COUNT", "1"))
 
+# Режим работы по расписанию (опционально)
+WORK_DURATION_MINUTES = os.getenv("VKCLOUD_WORK_DURATION_MINUTES")  # Время работы в минутах (None = без ограничений)
+PAUSE_DURATION_MINUTES = os.getenv("VKCLOUD_PAUSE_DURATION_MINUTES")  # Время паузы в минутах (None = без паузы)
+
 # Уведомления через apprise (опционально)
 APPRISE_URL = os.getenv("VKCLOUD_APPRISE_URL")  # URL для уведомлений через apprise
 
@@ -85,6 +89,11 @@ success_lock = threading.Lock()
 success_achieved = False
 success_ip = None
 success_worker_id = None
+
+# Глобальные переменные для режима работы по расписанию
+pause_event = threading.Event()
+work_start_time = None
+work_start_lock = threading.Lock()
 
 # ========= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =========
 def get_conn(auth_config=None) -> connection.Connection:
@@ -197,7 +206,7 @@ def send_notification(title: str, body: str, notification_type: str = "info"):
 # ========= ОСНОВНОЙ СЦЕНАРИЙ =========
 def worker(worker_id: int, server_id_or_name: str, port_id: str, ext_net_id: str):
     """Функция воркера для параллельного поиска floating IP."""
-    global success_achieved
+    global success_achieved, work_start_time
     
     auth_config = get_auth()
     conn = get_conn(auth_config)
@@ -205,6 +214,20 @@ def worker(worker_id: int, server_id_or_name: str, port_id: str, ext_net_id: str
     print(f"[Воркер {worker_id}] 🔗 Подключен к VK Cloud")
     
     while not stop_event.is_set():
+        # Проверка времени работы (если включен режим работы по расписанию)
+        if WORK_DURATION_MINUTES:
+            with work_start_lock:
+                if work_start_time is None:
+                    work_start_time = time.time()
+                elapsed_minutes = (time.time() - work_start_time) / 60
+                if elapsed_minutes >= float(WORK_DURATION_MINUTES):
+                    print(f"[Воркер {worker_id}] ⏸️  Время работы истекло ({WORK_DURATION_MINUTES} мин), ожидаю паузу...")
+                    pause_event.set()
+                    break
+        
+        # Проверка паузы
+        if pause_event.is_set():
+            break
         # Проверяем, не достиг ли успех другой воркер
         with success_lock:
             if success_achieved:
@@ -331,7 +354,43 @@ def worker(worker_id: int, server_id_or_name: str, port_id: str, ext_net_id: str
     if stop_event.is_set() and not success_achieved:
         print(f"[Воркер {worker_id}] 🛑 Остановлен")
 
+def run_work_cycle(server_id_or_name: str, port_id: str, ext_net_id: str):
+    """Запускает один цикл работы воркеров."""
+    global work_start_time, success_achieved, success_ip, success_worker_id
+    
+    # Сброс флагов для нового цикла
+    work_start_time = None
+    pause_event.clear()
+    stop_event.clear()
+    success_achieved = False
+    success_ip = None
+    success_worker_id = None
+    
+    print("🚀 Запускаю параллельный поиск подходящего floating IP…")
+    if WORK_DURATION_MINUTES:
+        print(f"⏱️  Режим работы по расписанию: работа {WORK_DURATION_MINUTES} мин, пауза {PAUSE_DURATION_MINUTES or 0} мин")
+    
+    # Запускаем воркеры
+    threads = []
+    for i in range(1, WORKERS_COUNT + 1):
+        t = threading.Thread(
+            target=worker,
+            args=(i, server_id_or_name, port_id, ext_net_id),
+            daemon=False
+        )
+        t.start()
+        threads.append(t)
+        time.sleep(0.1)  # Небольшая задержка между запусками
+    
+    # Ждем завершения всех воркеров
+    for t in threads:
+        t.join()
+    
+    return success_achieved
+
 def main():
+    global work_start_time
+    
     # Проверка обязательных параметров
     if not SERVER_ID_OR_NAME:
         raise SystemExit("❌ Отсутствует обязательная переменная окружения: VKCLOUD_SERVER_ID_OR_NAME")
@@ -339,10 +398,32 @@ def main():
     if WORKERS_COUNT < 1:
         raise SystemExit("❌ Количество воркеров должно быть >= 1")
     
+    # Проверка параметров режима работы по расписанию
+    if WORK_DURATION_MINUTES:
+        try:
+            work_duration = float(WORK_DURATION_MINUTES)
+            if work_duration <= 0:
+                raise SystemExit("❌ VKCLOUD_WORK_DURATION_MINUTES должно быть > 0")
+        except ValueError:
+            raise SystemExit("❌ VKCLOUD_WORK_DURATION_MINUTES должно быть числом")
+        
+        if PAUSE_DURATION_MINUTES:
+            try:
+                pause_duration = float(PAUSE_DURATION_MINUTES)
+                if pause_duration < 0:
+                    raise SystemExit("❌ VKCLOUD_PAUSE_DURATION_MINUTES должно быть >= 0")
+            except ValueError:
+                raise SystemExit("❌ VKCLOUD_PAUSE_DURATION_MINUTES должно быть числом")
+        else:
+            print("⚠️  Включен режим работы по расписанию, но не указана пауза. Будет бесконечный цикл работы.")
+    
     # Отправляем уведомление о старте
+    schedule_info = ""
+    if WORK_DURATION_MINUTES:
+        schedule_info = f" (режим работы: {WORK_DURATION_MINUTES} мин работа, {PAUSE_DURATION_MINUTES or 0} мин пауза)"
     send_notification(
         "VK Cloud: Запуск поиска Floating IP",
-        f"Запущено {WORKERS_COUNT} воркер(ов) для поиска IP в подсети {TARGET_NET}",
+        f"Запущено {WORKERS_COUNT} воркер(ов) для поиска IP в подсети {TARGET_NET}{schedule_info}",
         "info"
     )
     
@@ -359,47 +440,78 @@ def main():
     print(f"🌐 Внешняя сеть: {ext_net.name} ({ext_net.id})")
     print(f"🎯 Целевая подсеть: {TARGET_NET}")
     print(f"👷 Количество воркеров: {WORKERS_COUNT}")
-    print("🚀 Запускаю параллельный поиск подходящего floating IP…")
-
-    # Запускаем воркеры
-    threads = []
-    for i in range(1, WORKERS_COUNT + 1):
-        t = threading.Thread(
-            target=worker,
-            args=(i, SERVER_ID_OR_NAME, port.id, ext_net.id),
-            daemon=False
-        )
-        t.start()
-        threads.append(t)
-        time.sleep(0.1)  # Небольшая задержка между запусками
-
+    
     try:
-        # Ждем завершения всех воркеров
-        for t in threads:
-            t.join()
-        
-        if success_achieved:
-            print(f"\n✅ Успешно завершено! IP {success_ip} привязан воркером {success_worker_id}")
-            return 0
-        else:
-            print("⚠️ Все воркеры завершились, но успех не достигнут")
-            send_notification(
-                "VK Cloud: Поиск завершен без результата",
-                "Все воркеры завершились, но подходящий IP не найден",
-                "error"
-            )
-            return 1
+        # Основной цикл работы
+        cycle_number = 1
+        while True:
+            if cycle_number > 1:
+                print(f"\n{'='*60}")
+                print(f"🔄 Цикл работы #{cycle_number}")
+                print(f"{'='*60}\n")
+            
+            # Запускаем цикл работы
+            success = run_work_cycle(SERVER_ID_OR_NAME, port.id, ext_net.id)
+            
+            if success:
+                print(f"\n✅ Успешно завершено! IP {success_ip} привязан воркером {success_worker_id}")
+                send_notification(
+                    "VK Cloud: Floating IP найден и привязан",
+                    f"IP {success_ip} успешно привязан к ВМ воркером {success_worker_id}",
+                    "success"
+                )
+                return 0
+            
+            # Если включен режим работы по расписанию и время работы истекло
+            if WORK_DURATION_MINUTES and pause_event.is_set():
+                if not PAUSE_DURATION_MINUTES or float(PAUSE_DURATION_MINUTES) == 0:
+                    print("⚠️  Время работы истекло, но пауза не задана. Завершение работы.")
+                    send_notification(
+                        "VK Cloud: Время работы истекло",
+                        f"Время работы ({WORK_DURATION_MINUTES} мин) истекло, пауза не задана. Завершение.",
+                        "info"
+                    )
+                    return 1
+                
+                pause_seconds = float(PAUSE_DURATION_MINUTES) * 60
+                print(f"\n⏸️  Пауза на {PAUSE_DURATION_MINUTES} минут...")
+                send_notification(
+                    "VK Cloud: Пауза",
+                    f"Время работы ({WORK_DURATION_MINUTES} мин) истекло. Пауза на {PAUSE_DURATION_MINUTES} мин.",
+                    "info"
+                )
+                
+                # Ожидание паузы с возможностью прерывания
+                pause_start = time.time()
+                while time.time() - pause_start < pause_seconds:
+                    if stop_event.is_set():
+                        break
+                    time.sleep(1)
+                
+                if stop_event.is_set():
+                    break
+                
+                print(f"▶️  Пауза завершена, возобновляю работу...\n")
+                cycle_number += 1
+            else:
+                # Если режим работы по расписанию не включен, завершаем после первого цикла
+                print("⚠️ Все воркеры завершились, но успех не достигнут")
+                send_notification(
+                    "VK Cloud: Поиск завершен без результата",
+                    "Все воркеры завершились, но подходящий IP не найден",
+                    "error"
+                )
+                return 1
             
     except KeyboardInterrupt:
         print("\n🛑 Остановлено пользователем.")
         stop_event.set()
+        pause_event.set()
         send_notification(
             "VK Cloud: Поиск остановлен",
             "Поиск Floating IP остановлен пользователем",
             "info"
         )
-        for t in threads:
-            t.join(timeout=2)
         return 2
 
 if __name__ == "__main__":
