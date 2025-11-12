@@ -73,7 +73,9 @@ PORT_ID = os.getenv("VKCLOUD_PORT_ID")  # None если не задано
 SLEEP_BETWEEN_ATTEMPTS = float(os.getenv("VKCLOUD_SLEEP_BETWEEN_ATTEMPTS", "0.6"))
 ASSOC_WAIT = float(os.getenv("VKCLOUD_ASSOC_WAIT", "8.0"))
 TARGET_NET_STR = os.getenv("VKCLOUD_TARGET_NET", "95.163.248.0/22")
-TARGET_NET = ipaddress.ip_network(TARGET_NET_STR)
+# Поддержка нескольких подсетей через запятую
+TARGET_NETS_STR_LIST = [net.strip() for net in TARGET_NET_STR.split(",") if net.strip()]
+TARGET_NETS = [ipaddress.ip_network(net) for net in TARGET_NETS_STR_LIST]
 WORKERS_COUNT = int(os.getenv("VKCLOUD_WORKERS_COUNT", "1"))
 
 # Режим работы по расписанию (опционально)
@@ -115,8 +117,10 @@ def ensure_conn_alive(conn: connection.Connection) -> connection.Connection:
         return get_conn()
 
 def in_target_range(ip: str) -> bool:
+    """Проверяет, принадлежит ли IP одной из целевых подсетей."""
     try:
-        return ipaddress.ip_address(ip) in TARGET_NET
+        ip_addr = ipaddress.ip_address(ip)
+        return any(ip_addr in net for net in TARGET_NETS)
     except ValueError:
         return False
 
@@ -275,7 +279,8 @@ def worker(worker_id: int, server_id_or_name: str, port_id: str, ext_net_id: str
                     release_fip(conn, fip)
                     break
                 
-                print(f"[Воркер {worker_id}] ✅ IP {ip} принадлежит {TARGET_NET}. Привязываю к порту {port_id}…")
+                target_nets_str = ", ".join(str(net) for net in TARGET_NETS)
+                print(f"[Воркер {worker_id}] ✅ IP {ip} принадлежит одной из подсетей ({target_nets_str}). Привязываю к порту {port_id}…")
                 port = conn.network.get_port(port_id)
                 associate_fip(conn, fip, port)
 
@@ -312,7 +317,8 @@ def worker(worker_id: int, server_id_or_name: str, port_id: str, ext_net_id: str
                     fip = None
 
             else:
-                print(f"[Воркер {worker_id}] ❌ IP {ip} не из {TARGET_NET}, удаляю…")
+                target_nets_str = ", ".join(str(net) for net in TARGET_NETS)
+                print(f"[Воркер {worker_id}] ❌ IP {ip} не из целевых подсетей ({target_nets_str}), удаляю…")
                 release_fip(conn, fip)
                 fip = None
 
@@ -421,9 +427,10 @@ def main():
     schedule_info = ""
     if WORK_DURATION_MINUTES:
         schedule_info = f" (режим работы: {WORK_DURATION_MINUTES} мин работа, {PAUSE_DURATION_MINUTES or 0} мин пауза)"
+    target_nets_str = ", ".join(str(net) for net in TARGET_NETS)
     send_notification(
         "VK Cloud: Запуск поиска Floating IP",
-        f"Запущено {WORKERS_COUNT} воркер(ов) для поиска IP в подсети {TARGET_NET}{schedule_info}",
+        f"Запущено {WORKERS_COUNT} воркер(ов) для поиска IP в подсетях: {target_nets_str}{schedule_info}",
         "info"
     )
     
@@ -438,7 +445,10 @@ def main():
     print(f"🖥️  ВМ: {server.name} ({server.id})")
     print(f"🔌 Порт: {port.id}")
     print(f"🌐 Внешняя сеть: {ext_net.name} ({ext_net.id})")
-    print(f"🎯 Целевая подсеть: {TARGET_NET}")
+    if len(TARGET_NETS) == 1:
+        print(f"🎯 Целевая подсеть: {TARGET_NETS[0]}")
+    else:
+        print(f"🎯 Целевые подсети ({len(TARGET_NETS)}): {', '.join(str(net) for net in TARGET_NETS)}")
     print(f"👷 Количество воркеров: {WORKERS_COUNT}")
     
     try:
