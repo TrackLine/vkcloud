@@ -78,6 +78,9 @@ TARGET_NETS_STR_LIST = [net.strip() for net in TARGET_NET_STR.split(",") if net.
 TARGET_NETS = [ipaddress.ip_network(net) for net in TARGET_NETS_STR_LIST]
 WORKERS_COUNT = int(os.getenv("VKCLOUD_WORKERS_COUNT", "1"))
 
+# Режим последовательного перебора IP внутри диапазона
+SEQUENTIAL_IP_SCAN = os.getenv("VKCLOUD_SEQUENTIAL_IP_SCAN", "false").lower() == "true"
+
 # Режим работы по расписанию (опционально)
 WORK_DURATION_MINUTES = os.getenv("VKCLOUD_WORK_DURATION_MINUTES")  # Время работы в минутах (None = без ограничений)
 PAUSE_DURATION_MINUTES = os.getenv("VKCLOUD_PAUSE_DURATION_MINUTES")  # Время паузы в минутах (None = без паузы)
@@ -96,6 +99,10 @@ success_worker_id = None
 pause_event = threading.Event()
 work_start_time = None
 work_start_lock = threading.Lock()
+
+# Глобальные переменные для последовательного перебора IP
+ip_iterators = {}  # Словарь итераторов для каждой подсети
+ip_iterators_lock = threading.Lock()
 
 # ========= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =========
 def get_conn(auth_config=None) -> connection.Connection:
@@ -154,8 +161,69 @@ def find_external_network(conn: connection.Connection, name_or_id: str | None):
             return net
     raise SystemExit("❌ Внешняя сеть не найдена. Укажите EXT_NET_NAME явно.")
 
-def allocate_fip(conn: connection.Connection, ext_net_id: str):
-    return conn.network.create_ip(floating_network_id=ext_net_id)
+def allocate_fip(conn: connection.Connection, ext_net_id: str, specific_ip: str = None):
+    """Выделяет floating IP. Если указан specific_ip, пытается выделить именно этот IP."""
+    if specific_ip:
+        try:
+            # Пытаемся выделить конкретный IP адрес
+            return conn.network.create_ip(
+                floating_network_id=ext_net_id,
+                floating_ip_address=specific_ip
+            )
+        except Exception:
+            # Если не удалось выделить конкретный IP, возвращаем None
+            # Вызывающий код должен обработать это и попробовать без указания IP
+            return None
+    else:
+        # Обычное выделение случайного IP
+        return conn.network.create_ip(floating_network_id=ext_net_id)
+
+def get_next_ip_from_networks():
+    """Генерирует следующий IP адрес для перебора из целевых подсетей."""
+    global ip_iterators
+    
+    with ip_iterators_lock:
+        if not ip_iterators:
+            # Инициализируем итераторы для каждой подсети
+            for net in TARGET_NETS:
+                # Пропускаем сетевой адрес и broadcast адрес
+                hosts = list(net.hosts())
+                if hosts:
+                    ip_iterators[str(net)] = iter(hosts)
+        
+        # Пробуем получить IP из каждой подсети по очереди
+        for net in TARGET_NETS:
+            net_str = str(net)
+            if net_str in ip_iterators:
+                try:
+                    return str(next(ip_iterators[net_str]))
+                except StopIteration:
+                    # Подсеть закончилась, перезапускаем итератор
+                    hosts = list(net.hosts())
+                    if hosts:
+                        ip_iterators[net_str] = iter(hosts)
+                        return str(next(ip_iterators[net_str]))
+                    else:
+                        # Подсеть пустая, удаляем итератор
+                        del ip_iterators[net_str]
+        
+        # Если все подсети закончились, перезапускаем все итераторы
+        ip_iterators.clear()
+        for net in TARGET_NETS:
+            hosts = list(net.hosts())
+            if hosts:
+                ip_iterators[str(net)] = iter(hosts)
+        
+        # Пробуем снова
+        for net in TARGET_NETS:
+            net_str = str(net)
+            if net_str in ip_iterators:
+                try:
+                    return str(next(ip_iterators[net_str]))
+                except StopIteration:
+                    continue
+        
+        return None
 
 def associate_fip(conn: connection.Connection, fip, port):
     return conn.network.update_ip(fip, port_id=port.id)
@@ -256,7 +324,22 @@ def worker(worker_id: int, server_id_or_name: str, port_id: str, ext_net_id: str
                 break
             
             # 1) выделяем floating IP
-            fip = allocate_fip(conn, ext_net_id)
+            specific_ip = None
+            if SEQUENTIAL_IP_SCAN:
+                specific_ip = get_next_ip_from_networks()
+                if specific_ip:
+                    # Пытаемся выделить конкретный IP
+                    fip = allocate_fip(conn, ext_net_id, specific_ip)
+                    if not fip:
+                        # Не удалось выделить конкретный IP, пробуем обычным способом
+                        fip = allocate_fip(conn, ext_net_id)
+                else:
+                    # Итераторы закончились, используем обычный способ
+                    fip = allocate_fip(conn, ext_net_id)
+            else:
+                # Обычный режим - случайный IP
+                fip = allocate_fip(conn, ext_net_id)
+            
             ip = getattr(fip, "floating_ip_address", None)
             if not ip:
                 print(f"[Воркер {worker_id}] ⚠️  Получен FIP без адреса — освобождаю и повторяю…")
@@ -265,7 +348,10 @@ def worker(worker_id: int, server_id_or_name: str, port_id: str, ext_net_id: str
                 time.sleep(SLEEP_BETWEEN_ATTEMPTS)
                 continue
 
-            print(f"[Воркер {worker_id}] 🔹 Выделен IP: {ip}")
+            if SEQUENTIAL_IP_SCAN and specific_ip:
+                print(f"[Воркер {worker_id}] 🔹 Выделен IP: {ip} (попытка выделить {specific_ip})")
+            else:
+                print(f"[Воркер {worker_id}] 🔹 Выделен IP: {ip}")
 
             # Проверка после выделения IP
             if stop_event.is_set():
@@ -362,7 +448,7 @@ def worker(worker_id: int, server_id_or_name: str, port_id: str, ext_net_id: str
 
 def run_work_cycle(server_id_or_name: str, port_id: str, ext_net_id: str):
     """Запускает один цикл работы воркеров."""
-    global work_start_time, success_achieved, success_ip, success_worker_id
+    global work_start_time, success_achieved, success_ip, success_worker_id, ip_iterators
     
     # Сброс флагов для нового цикла
     work_start_time = None
@@ -372,7 +458,14 @@ def run_work_cycle(server_id_or_name: str, port_id: str, ext_net_id: str):
     success_ip = None
     success_worker_id = None
     
+    # Сброс итераторов IP при новом цикле (если включен последовательный перебор)
+    if SEQUENTIAL_IP_SCAN:
+        with ip_iterators_lock:
+            ip_iterators.clear()
+    
     print("🚀 Запускаю параллельный поиск подходящего floating IP…")
+    if SEQUENTIAL_IP_SCAN:
+        print(f"🔢 Режим последовательного перебора IP: включен")
     if WORK_DURATION_MINUTES:
         print(f"⏱️  Режим работы по расписанию: работа {WORK_DURATION_MINUTES} мин, пауза {PAUSE_DURATION_MINUTES or 0} мин")
     
