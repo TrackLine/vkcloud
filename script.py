@@ -501,7 +501,15 @@ def main():
                 if stop_event.is_set():
                     break
                 
+                # Сбрасываем pause_event перед новым циклом
+                pause_event.clear()
+                
                 print(f"▶️  Пауза завершена, возобновляю работу...\n")
+                send_notification(
+                    "VK Cloud: Возобновление работы",
+                    f"Пауза завершена. Начинаю цикл работы #{cycle_number + 1}.",
+                    "info"
+                )
                 cycle_number += 1
             else:
                 # Если режим работы по расписанию не включен, завершаем после первого цикла
